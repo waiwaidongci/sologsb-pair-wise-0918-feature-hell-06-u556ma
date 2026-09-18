@@ -39,7 +39,8 @@ const initialData = {
       qualified: false,
       note: "仍偏快，振幅尚可"
     }
-  ]
+  ],
+  partClaims: []
 };
 
 const routes = [
@@ -51,8 +52,12 @@ const routes = [
   "POST /clocks/:id/adjustments",
   "POST /clocks/:id/retests",
   "GET /clocks/:id/latest-retest",
+  "GET /clocks/:id/part-claims",
+  "POST /clocks/:id/part-claims",
+  "POST /clocks/:id/part-claims/:claimId/cancel",
   "GET /adjustments",
-  "GET /retests"
+  "GET /retests",
+  "GET /part-claims"
 ];
 
 async function ensureDb() {
@@ -66,7 +71,12 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  db.clocks = db.clocks || [];
+  db.adjustments = db.adjustments || [];
+  db.retests = db.retests || [];
+  db.partClaims = db.partClaims || [];
+  return db;
 }
 
 async function writeDb(data) {
@@ -126,14 +136,46 @@ function latestAdjustment(db, clockId) {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] || null;
 }
 
+function findPartClaim(db, clockId, claimId) {
+  const claim = db.partClaims.find((item) => item.id === claimId && item.clockId === clockId);
+  if (!claim) {
+    const error = new Error("零件领用记录不存在");
+    error.status = 404;
+    throw error;
+  }
+  return claim;
+}
+
+function activePartClaims(db, clockId) {
+  return db.partClaims.filter((item) => item.clockId === clockId && item.status === "active");
+}
+
+function currentParts(db, clockId) {
+  return db.partClaims
+    .filter((item) => item.clockId === clockId && (item.status === "active" || item.status === "installed"))
+    .map((item) => ({
+      claimId: item.id,
+      serialNumber: item.serialNumber,
+      status: item.status,
+      adjustmentId: item.adjustmentId || null,
+      claimedAt: item.createdAt,
+      installedAt: item.installedAt || null
+    }));
+}
+
 function clockSummary(db, clock) {
   const retest = latestRetest(db, clock.id);
   const adjustment = latestAdjustment(db, clock.id);
+  const parts = currentParts(db, clock.id);
+  const pendingInstallations = parts.filter((item) => item.status === "active").length;
   return {
     ...clock,
     latestAdjustment: adjustment,
     latestRetest: retest,
-    qualified: retest ? retest.qualified : false
+    qualified: retest ? retest.qualified : false,
+    currentParts: parts,
+    pendingInstallations,
+    retestEligible: pendingInstallations === 0
   };
 }
 
@@ -183,7 +225,8 @@ async function handle(req, res) {
     const clock = findClock(db, historyMatch[1]);
     const adjustments = db.adjustments.filter((item) => item.clockId === clock.id);
     const retests = db.retests.filter((item) => item.clockId === clock.id);
-    return send(res, 200, { data: { clock, adjustments, retests, latestRetest: latestRetest(db, clock.id) } });
+    const partClaims = db.partClaims.filter((item) => item.clockId === clock.id);
+    return send(res, 200, { data: { clock, adjustments, retests, partClaims, latestRetest: latestRetest(db, clock.id) } });
   }
 
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
@@ -198,11 +241,39 @@ async function handle(req, res) {
       direction: body.direction,
       amount: body.amount,
       note: body.note || "",
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      partInstallations: []
     };
+    const installations = body.partInstallations === undefined ? [] : body.partInstallations;
+    if (!Array.isArray(installations)) {
+      const error = new Error("partInstallations必须是数组");
+      error.status = 400;
+      throw error;
+    }
+    for (const item of installations) {
+      required(item, ["claimId"]);
+      const claim = findPartClaim(db, clock.id, item.claimId);
+      if (claim.status !== "active") {
+        const error = new Error(`零件 ${claim.serialNumber} 的领用记录已${claim.status === "installed" ? "安装" : "取消"}，不能重复登记安装`);
+        error.status = 409;
+        throw error;
+      }
+      const installed = item.installed === undefined ? true : Boolean(item.installed);
+      if (installed) {
+        claim.status = "installed";
+        claim.adjustmentId = adjustment.id;
+        claim.installedAt = adjustment.createdAt;
+      }
+      adjustment.partInstallations.push({
+        claimId: claim.id,
+        serialNumber: claim.serialNumber,
+        installed,
+        note: item.note || ""
+      });
+    }
     db.adjustments.push(adjustment);
     await writeDb(db);
-    return send(res, 201, { data: adjustment });
+    return send(res, 201, { data: adjustment, clock: clockSummary(db, clock) });
   }
 
   const retestMatch = pathname.match(/^\/clocks\/([^/]+)\/retests$/);
@@ -210,6 +281,12 @@ async function handle(req, res) {
     const clock = findClock(db, retestMatch[1]);
     const body = await parseBody(req);
     required(body, ["dailyRateSeconds", "amplitude"]);
+    const pending = activePartClaims(db, clock.id);
+    if (pending.length) {
+      const error = new Error(`存在未登记安装结果的领用零件：${pending.map((item) => item.serialNumber).join(", ")}，请先在当前调校中登记安装或取消领用`);
+      error.status = 409;
+      throw error;
+    }
     const adjustmentId = body.adjustmentId || latestAdjustment(db, clock.id)?.id || null;
     const qualified = body.qualified !== undefined
       ? Boolean(body.qualified)
@@ -227,6 +304,63 @@ async function handle(req, res) {
     db.retests.push(retest);
     await writeDb(db);
     return send(res, 201, { data: retest, clock: clockSummary(db, clock) });
+  }
+
+  const partClaimListMatch = pathname.match(/^\/clocks\/([^/]+)\/part-claims$/);
+  if (partClaimListMatch && req.method === "GET") {
+    const clock = findClock(db, partClaimListMatch[1]);
+    const status = url.searchParams.get("status");
+    const data = db.partClaims.filter((item) => item.clockId === clock.id && (status === null || item.status === status));
+    return send(res, 200, { data });
+  }
+
+  if (partClaimListMatch && req.method === "POST") {
+    const clock = findClock(db, partClaimListMatch[1]);
+    const body = await parseBody(req);
+    required(body, ["serialNumber"]);
+    const serialNumber = String(body.serialNumber).trim();
+    const occupied = db.partClaims.find(
+      (item) => item.serialNumber === serialNumber && (item.status === "active" || item.status === "installed")
+    );
+    if (occupied) {
+      const error = new Error(`零件 ${serialNumber} ${occupied.status === "installed" ? "已安装" : "已被领用"}，不能重复领用`);
+      error.status = 409;
+      throw error;
+    }
+    const claim = {
+      id: makeId("claim"),
+      clockId: clock.id,
+      serialNumber,
+      status: "active",
+      adjustmentId: null,
+      note: body.note || "",
+      createdAt: new Date().toISOString(),
+      installedAt: null,
+      cancelledAt: null
+    };
+    db.partClaims.push(claim);
+    await writeDb(db);
+    return send(res, 201, { data: claim, clock: clockSummary(db, clock) });
+  }
+
+  const partClaimCancelMatch = pathname.match(/^\/clocks\/([^/]+)\/part-claims\/([^/]+)\/cancel$/);
+  if (partClaimCancelMatch && req.method === "POST") {
+    const clock = findClock(db, partClaimCancelMatch[1]);
+    const claim = findPartClaim(db, clock.id, partClaimCancelMatch[2]);
+    if (claim.status === "installed") {
+      const error = new Error(`零件 ${claim.serialNumber} 已安装，不能取消领用`);
+      error.status = 409;
+      throw error;
+    }
+    if (claim.status === "cancelled") {
+      const error = new Error(`零件 ${claim.serialNumber} 的领用已取消，不能重复取消`);
+      error.status = 409;
+      throw error;
+    }
+    claim.status = "cancelled";
+    claim.cancelledAt = new Date().toISOString();
+    await writeDb(db);
+    return send(res, 200, { data: claim, clock: clockSummary(db, clock) });
   }
 
   const latestMatch = pathname.match(/^\/clocks\/([^/]+)\/latest-retest$/);
@@ -247,6 +381,19 @@ async function handle(req, res) {
       const matchClock = !clockId || item.clockId === clockId;
       const matchQualified = qualified === null || item.qualified === (qualified === "true");
       return matchClock && matchQualified;
+    });
+    return send(res, 200, { data });
+  }
+
+  if (req.method === "GET" && pathname === "/part-claims") {
+    const clockId = url.searchParams.get("clockId");
+    const status = url.searchParams.get("status");
+    const serialNumber = url.searchParams.get("serialNumber");
+    const data = db.partClaims.filter((item) => {
+      const matchClock = !clockId || item.clockId === clockId;
+      const matchStatus = !status || item.status === status;
+      const matchSerial = !serialNumber || item.serialNumber === serialNumber;
+      return matchClock && matchStatus && matchSerial;
     });
     return send(res, 200, { data });
   }
