@@ -39,7 +39,9 @@ const initialData = {
       qualified: false,
       note: "仍偏快，振幅尚可"
     }
-  ]
+  ],
+  partRequisitions: [],
+  installations: []
 };
 
 const routes = [
@@ -51,6 +53,11 @@ const routes = [
   "POST /clocks/:id/adjustments",
   "POST /clocks/:id/retests",
   "GET /clocks/:id/latest-retest",
+  "POST /clocks/:id/part-requisitions",
+  "GET /clocks/:id/part-requisitions",
+  "POST /clocks/:id/part-requisitions/:requisitionId/installations",
+  "POST /clocks/:id/part-requisitions/:requisitionId/cancel",
+  "GET /part-requisitions?clockId=&serialNumber=&status=",
   "GET /adjustments",
   "GET /retests"
 ];
@@ -66,7 +73,11 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  // 兼容旧库文件：补齐零件领用闭环所需集合
+  if (!Array.isArray(db.partRequisitions)) db.partRequisitions = [];
+  if (!Array.isArray(db.installations)) db.installations = [];
+  return db;
 }
 
 async function writeDb(data) {
@@ -114,6 +125,83 @@ function findClock(db, clockId) {
   return clock;
 }
 
+function conflict(message) {
+  const error = new Error(message);
+  error.status = 409;
+  return error;
+}
+
+// 活跃领用 = 未取消，即「领用中」或「已安装」
+function activeRequisitions(db, clockId) {
+  return db.partRequisitions.filter(
+    (item) => item.clockId === clockId && item.status !== "canceled"
+  );
+}
+
+function findRequisition(db, clockId, requisitionId) {
+  const requisition = db.partRequisitions.find(
+    (item) => item.id === requisitionId && item.clockId === clockId
+  );
+  if (!requisition) {
+    const error = new Error("零件领用记录不存在");
+    error.status = 404;
+    throw error;
+  }
+  return requisition;
+}
+
+function installationsOf(db, requisitionId) {
+  return db.installations
+    .filter((item) => item.requisitionId === requisitionId)
+    .sort((a, b) => new Date(a.installedAt) - new Date(b.installedAt));
+}
+
+function requisitionView(db, requisition) {
+  return { ...requisition, installations: installationsOf(db, requisition.id) };
+}
+
+// 当前零件：优先当前调校上已成功安装的零件，否则取最近一条领而未装的零件
+function currentPart(db, clockId, latestAdjustmentId) {
+  const active = activeRequisitions(db, clockId);
+  const installedHere = latestAdjustmentId
+    ? active.find(
+        (item) =>
+          item.status === "installed" && item.installedAdjustmentId === latestAdjustmentId
+      )
+    : null;
+  const picked =
+    installedHere ||
+    active
+      .filter((item) => item.status === "requisitioned")
+      .sort((a, b) => new Date(b.requisitionedAt) - new Date(a.requisitionedAt))[0] ||
+    null;
+  return picked ? requisitionView(db, picked) : null;
+}
+
+// 可复测：当前调校存在，已登记成功安装，且没有领而未装的零件
+function canRetestInfo(db, clockId, latestAdjustmentId) {
+  if (!latestAdjustmentId) {
+    return { canRetest: false, reason: "尚无调校记录，无法复测" };
+  }
+  const pending = activeRequisitions(db, clockId).filter(
+    (item) => item.status === "requisitioned"
+  );
+  if (pending.length) {
+    return {
+      canRetest: false,
+      reason: `有${pending.length}件领用零件尚未登记安装结果，不能复测`
+    };
+  }
+  const installed = activeRequisitions(db, clockId).some(
+    (item) =>
+      item.status === "installed" && item.installedAdjustmentId === latestAdjustmentId
+  );
+  if (!installed) {
+    return { canRetest: false, reason: "当前调校尚未登记零件安装结果，不能复测" };
+  }
+  return { canRetest: true, reason: null };
+}
+
 function latestRetest(db, clockId) {
   return db.retests
     .filter((item) => item.clockId === clockId)
@@ -129,11 +217,15 @@ function latestAdjustment(db, clockId) {
 function clockSummary(db, clock) {
   const retest = latestRetest(db, clock.id);
   const adjustment = latestAdjustment(db, clock.id);
+  const retestInfo = canRetestInfo(db, clock.id, adjustment?.id);
   return {
     ...clock,
     latestAdjustment: adjustment,
     latestRetest: retest,
-    qualified: retest ? retest.qualified : false
+    qualified: retest ? retest.qualified : false,
+    currentPart: currentPart(db, clock.id, adjustment?.id),
+    canRetest: retestInfo.canRetest,
+    retestBlockReason: retestInfo.reason
   };
 }
 
@@ -183,7 +275,23 @@ async function handle(req, res) {
     const clock = findClock(db, historyMatch[1]);
     const adjustments = db.adjustments.filter((item) => item.clockId === clock.id);
     const retests = db.retests.filter((item) => item.clockId === clock.id);
-    return send(res, 200, { data: { clock, adjustments, retests, latestRetest: latestRetest(db, clock.id) } });
+    const partRequisitions = db.partRequisitions
+      .filter((item) => item.clockId === clock.id)
+      .sort((a, b) => new Date(b.requisitionedAt) - new Date(a.requisitionedAt))
+      .map((item) => requisitionView(db, item));
+    const installations = db.installations
+      .filter((item) => item.clockId === clock.id)
+      .sort((a, b) => new Date(b.installedAt) - new Date(a.installedAt));
+    return send(res, 200, {
+      data: {
+        clock,
+        adjustments,
+        retests,
+        partRequisitions,
+        installations,
+        latestRetest: latestRetest(db, clock.id)
+      }
+    });
   }
 
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
@@ -210,7 +318,13 @@ async function handle(req, res) {
     const clock = findClock(db, retestMatch[1]);
     const body = await parseBody(req);
     required(body, ["dailyRateSeconds", "amplitude"]);
-    const adjustmentId = body.adjustmentId || latestAdjustment(db, clock.id)?.id || null;
+    const adjustment = latestAdjustment(db, clock.id);
+    const retestInfo = canRetestInfo(db, clock.id, adjustment?.id);
+    if (!retestInfo.canRetest) {
+      // 校验在写库之前，409 不落库
+      throw conflict(retestInfo.reason);
+    }
+    const adjustmentId = body.adjustmentId || adjustment.id;
     const qualified = body.qualified !== undefined
       ? Boolean(body.qualified)
       : Math.abs(Number(body.dailyRateSeconds)) <= Number(clock.targetDailyRateSeconds);
@@ -233,6 +347,143 @@ async function handle(req, res) {
   if (latestMatch && req.method === "GET") {
     findClock(db, latestMatch[1]);
     return send(res, 200, { data: latestRetest(db, latestMatch[1]) });
+  }
+
+  const requisitionListMatch = pathname.match(/^\/clocks\/([^/]+)\/part-requisitions$/);
+  if (requisitionListMatch && req.method === "GET") {
+    const clock = findClock(db, requisitionListMatch[1]);
+    const data = db.partRequisitions
+      .filter((item) => item.clockId === clock.id)
+      .sort((a, b) => new Date(b.requisitionedAt) - new Date(a.requisitionedAt))
+      .map((item) => requisitionView(db, item));
+    return send(res, 200, { data });
+  }
+
+  const requisitionCreateMatch = pathname.match(/^\/clocks\/([^/]+)\/part-requisitions$/);
+  if (requisitionCreateMatch && req.method === "POST") {
+    const clock = findClock(db, requisitionCreateMatch[1]);
+    const body = await parseBody(req);
+    required(body, ["serialNumber", "partName"]);
+    const serialNumber = String(body.serialNumber).trim();
+    // 序列号全局唯一：任何未取消的领用都占用该序列号；以下冲突均在写库前判定
+    const existing = db.partRequisitions.find(
+      (item) => item.serialNumber === serialNumber && item.status !== "canceled"
+    );
+    if (existing) {
+      if (existing.status === "installed") {
+        throw conflict(`零件序列号 ${serialNumber} 已安装在钟表 ${existing.clockId} 上，不能重复领用`);
+      }
+      throw conflict(
+        `零件序列号 ${serialNumber} 已被钟表 ${existing.clockId} 领用且尚未安装，不能重复领用`
+      );
+    }
+    const requisition = {
+      id: makeId("requisition"),
+      clockId: clock.id,
+      serialNumber,
+      partName: body.partName,
+      specification: body.specification || "",
+      note: body.note || "",
+      status: "requisitioned",
+      requisitionedAt: new Date().toISOString(),
+      installedAt: null,
+      installedAdjustmentId: null,
+      canceledAt: null,
+      cancelReason: ""
+    };
+    db.partRequisitions.push(requisition);
+    await writeDb(db);
+    return send(res, 201, { data: requisitionView(db, requisition), clock: clockSummary(db, clock) });
+  }
+
+  const installationMatch = pathname.match(
+    /^\/clocks\/([^/]+)\/part-requisitions\/([^/]+)\/installations$/
+  );
+  if (installationMatch && req.method === "POST") {
+    const clock = findClock(db, installationMatch[1]);
+    const requisition = findRequisition(db, clock.id, installationMatch[2]);
+    const body = await parseBody(req);
+    const result = body.result || "success";
+    if (!["success", "failed"].includes(result)) {
+      const error = new Error("安装结果 result 只能是 success 或 failed");
+      error.status = 400;
+      throw error;
+    }
+    // 冲突在写库前判定
+    if (requisition.status === "canceled") {
+      throw conflict("该领用已取消，请重新领用后再登记安装");
+    }
+    if (requisition.status === "installed") {
+      throw conflict("该零件已登记安装结果，不能重复安装");
+    }
+    const adjustment = latestAdjustment(db, clock.id);
+    if (!adjustment) {
+      const error = new Error("当前没有调校记录，请先创建调校再登记安装");
+      error.status = 409;
+      throw error;
+    }
+    const installation = {
+      id: makeId("installation"),
+      clockId: clock.id,
+      requisitionId: requisition.id,
+      serialNumber: requisition.serialNumber,
+      adjustmentId: adjustment.id,
+      result,
+      position: body.position || "",
+      technician: body.technician || "",
+      note: body.note || "",
+      installedAt: new Date().toISOString()
+    };
+    // 只有成功安装才把零件标记为已安装；失败保持领用中，允许重试或取消
+    if (result === "success") {
+      requisition.status = "installed";
+      requisition.installedAt = installation.installedAt;
+      requisition.installedAdjustmentId = adjustment.id;
+    }
+    db.installations.push(installation);
+    await writeDb(db);
+    return send(res, 201, {
+      data: installation,
+      requisition: requisitionView(db, requisition),
+      clock: clockSummary(db, clock)
+    });
+  }
+
+  const cancelMatch = pathname.match(
+    /^\/clocks\/([^/]+)\/part-requisitions\/([^/]+)\/cancel$/
+  );
+  if (cancelMatch && req.method === "POST") {
+    const clock = findClock(db, cancelMatch[1]);
+    const requisition = findRequisition(db, clock.id, cancelMatch[2]);
+    const body = await parseBody(req);
+    // 冲突在写库前判定
+    if (requisition.status === "installed") {
+      throw conflict("零件已安装，不能取消领用");
+    }
+    if (requisition.status === "canceled") {
+      throw conflict("该领用已取消，无需重复取消");
+    }
+    requisition.status = "canceled";
+    requisition.canceledAt = new Date().toISOString();
+    requisition.cancelReason = body.reason || body.note || "";
+    await writeDb(db);
+    return send(res, 200, { data: requisitionView(db, requisition), clock: clockSummary(db, clock) });
+  }
+
+  if (req.method === "GET" && pathname === "/part-requisitions") {
+    const clockId = url.searchParams.get("clockId");
+    const serialNumber = url.searchParams.get("serialNumber");
+    const status = url.searchParams.get("status");
+    const data = db.partRequisitions
+      .filter((item) => {
+        const matchClock = !clockId || item.clockId === clockId;
+        const matchSerial = !serialNumber || item.serialNumber === serialNumber;
+        const matchStatus = !status || item.status === status;
+        return matchClock && matchSerial && matchStatus;
+      })
+      .sort((a, b) => new Date(b.requisitionedAt) - new Date(a.requisitionedAt))
+      .map((item) => requisitionView(db, item));
+    return send(res, 200, { data });
   }
 
   if (req.method === "GET" && pathname === "/adjustments") {
